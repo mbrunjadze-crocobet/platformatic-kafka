@@ -37,7 +37,8 @@ import {
   type ConsumeOptions,
   type CorruptedMessageHandler,
   type GroupAssignment,
-  type Offsets
+  type Offsets,
+  type TopicPartition
 } from './types.ts'
 
 // Don't move this function as being in the same file will enable V8 to remove.
@@ -71,6 +72,7 @@ export class MessagesStream<Key, Value, HeaderKey, HeaderValue> extends Readable
   #mode: string
   #fallbackMode: string
   #paused: boolean
+  #pausedTopicPartitions: Map<string, TopicPartition>
   #refreshOffsetsInflight: boolean
   #refreshOffsetsPending: boolean
   #refreshOffsetsDestroyOnError: boolean
@@ -161,6 +163,7 @@ export class MessagesStream<Key, Value, HeaderKey, HeaderValue> extends Readable
     this.#offsetsCommitted = new Map()
     this.#partitionsEpochs = new Map()
     this.#paused = false
+    this.#pausedTopicPartitions = new Map()
     this.#refreshOffsetsInflight = false
     this.#refreshOffsetsPending = false
     this.#refreshOffsetsDestroyOnError = false
@@ -212,6 +215,7 @@ export class MessagesStream<Key, Value, HeaderKey, HeaderValue> extends Readable
     this.#consumer.on('consumer:group:join', () => {
       this.#offsetsCommitted.clear()
       this.#scheduleRefreshOffsetsAndFetch()
+      this.#updatePausedTopicPartitions()
     })
 
     if (consumer[kPrometheus]) {
@@ -344,6 +348,68 @@ export class MessagesStream<Key, Value, HeaderKey, HeaderValue> extends Readable
     return super.pause()
   }
 
+  pauseTopicPartitions (topicPartitions: TopicPartition[] | GroupAssignment[]): void {
+    // Track which topic-partitions were actually paused for emitting an event
+    const paused: TopicPartition[] = []
+    const normalized = topicPartitions.flatMap<TopicPartition>(pair =>
+      'partitions' in pair ? pair.partitions.map(partition => ({ topic: pair.topic, partition })) : pair)
+
+    const assignmentsAsKeys = this.#assignmentsAsKeys()
+    if (!assignmentsAsKeys) {
+      throw new UserError('No current assignments for consumer')
+    }
+
+    for (const pair of normalized) {
+      const key = `${pair.topic}:${pair.partition}`
+      if (!assignmentsAsKeys.has(key)) {
+        throw new UserError(`No current assignment for partition ${key}`)
+      }
+
+      if (!this.#pausedTopicPartitions.has(key)) {
+        this.#pausedTopicPartitions.set(key, pair)
+        paused.push(pair)
+      }
+    }
+
+    if (paused.length > 0) {
+      this.emit('pausedTopicPartitions', paused)
+      this.#afterPausedTopicPartitionsChange()
+    }
+  }
+
+  resumeTopicPartitions (topicPartitions: TopicPartition[] | GroupAssignment[]): void {
+    // Track which topic-partitions were actually resumed for emitting an event
+    const resumed: TopicPartition[] = []
+    const normalized = topicPartitions.flatMap<TopicPartition>(pair =>
+      'partitions' in pair ? pair.partitions.map(partition => ({ topic: pair.topic, partition })) : pair)
+
+    const assignmentsAsKeys = this.#assignmentsAsKeys()
+    if (!assignmentsAsKeys) {
+      throw new UserError('No current assignments for consumer')
+    }
+
+    for (const pair of normalized) {
+      const key = `${pair.topic}:${pair.partition}`
+      if (!assignmentsAsKeys.has(key)) {
+        throw new UserError(`No current assignment for partition ${key}`)
+      }
+
+      if (this.#pausedTopicPartitions.has(key)) {
+        this.#pausedTopicPartitions.delete(key)
+        resumed.push(pair)
+      }
+    }
+
+    if (resumed.length > 0) {
+      this.emit('resumedTopicPartitions', resumed)
+      this.#afterPausedTopicPartitionsChange()
+    }
+  }
+
+  getPausedTopicPartitions (): TopicPartition[] {
+    return Array.from(this.#pausedTopicPartitions.values())
+  }
+
   /*
     TypeScript support - Extracted from node @types/node/stream.d.ts
 
@@ -372,6 +438,8 @@ export class MessagesStream<Key, Value, HeaderKey, HeaderValue> extends Readable
   addListener (event: 'pause', listener: () => void): this
   addListener (event: 'readable', listener: () => void): this
   addListener (event: 'resume', listener: () => void): this
+  addListener (event: 'pausedTopicPartitions', listener: (topicPartitions: TopicPartition[]) => void): this
+  addListener (event: 'resumedTopicPartitions', listener: (topicPartitions: TopicPartition[]) => void): this
   /* c8 ignore next 3 - Only forwards to Node.js implementation - Inserted here to please Typescript */
   addListener (event: string | symbol, listener: (...args: any[]) => void): this {
     return super.addListener(event, listener)
@@ -387,6 +455,8 @@ export class MessagesStream<Key, Value, HeaderKey, HeaderValue> extends Readable
   on (event: 'pause', listener: () => void): this
   on (event: 'readable', listener: () => void): this
   on (event: 'resume', listener: () => void): this
+  on (event: 'pausedTopicPartitions', listener: (topicPartitions: TopicPartition[]) => void): this
+  on (event: 'resumedTopicPartitions', listener: (topicPartitions: TopicPartition[]) => void): this
   /* c8 ignore next 3 - Only forwards to Node.js implementation - Inserted here to please Typescript */
   on (event: string | symbol, listener: (...args: any[]) => void): this {
     return super.on(event, listener)
@@ -402,6 +472,8 @@ export class MessagesStream<Key, Value, HeaderKey, HeaderValue> extends Readable
   once (event: 'pause', listener: () => void): this
   once (event: 'readable', listener: () => void): this
   once (event: 'resume', listener: () => void): this
+  once (event: 'pausedTopicPartitions', listener: (topicPartitions: TopicPartition[]) => void): this
+  once (event: 'resumedTopicPartitions', listener: (topicPartitions: TopicPartition[]) => void): this
   /* c8 ignore next 3 - Only forwards to Node.js implementation - Inserted here to please Typescript */
   once (event: string | symbol, listener: (...args: any[]) => void): this {
     return super.once(event, listener)
@@ -417,6 +489,8 @@ export class MessagesStream<Key, Value, HeaderKey, HeaderValue> extends Readable
   prependListener (event: 'pause', listener: () => void): this
   prependListener (event: 'readable', listener: () => void): this
   prependListener (event: 'resume', listener: () => void): this
+  prependListener (event: 'pausedTopicPartitions', listener: (topicPartitions: TopicPartition[]) => void): this
+  prependListener (event: 'resumedTopicPartitions', listener: (topicPartitions: TopicPartition[]) => void): this
   /* c8 ignore next 3 - Only forwards to Node.js implementation - Inserted here to please Typescript */
   prependListener (event: string | symbol, listener: (...args: any[]) => void): this {
     return super.prependListener(event, listener)
@@ -432,6 +506,8 @@ export class MessagesStream<Key, Value, HeaderKey, HeaderValue> extends Readable
   prependOnceListener (event: 'pause', listener: () => void): this
   prependOnceListener (event: 'readable', listener: () => void): this
   prependOnceListener (event: 'resume', listener: () => void): this
+  prependOnceListener (event: 'pausedTopicPartitions', listener: (topicPartitions: TopicPartition[]) => void): this
+  prependOnceListener (event: 'resumedTopicPartitions', listener: (topicPartitions: TopicPartition[]) => void): this
   /* c8 ignore next 3 - Only forwards to Node.js implementation - Inserted here to please Typescript */
   prependOnceListener (event: string | symbol, listener: (...args: any[]) => void): this {
     return super.prependOnceListener(event, listener)
@@ -506,7 +582,15 @@ export class MessagesStream<Key, Value, HeaderKey, HeaderValue> extends Readable
           continue
         }
 
-        const partitions = assignment.partitions
+        let partitions = assignment.partitions
+        if (this.#pausedTopicPartitions.size > 0) {
+          partitions = partitions.filter(partition => !this.#pausedTopicPartitions.has(`${topic}:${partition}`))
+        }
+
+        // All partitions for this topic were paused, continue
+        if (partitions.length === 0) {
+          continue
+        }
 
         for (const partition of partitions) {
           const leader = metadata!.topics.get(topic)!.partitions[partition].leader
@@ -545,34 +629,37 @@ export class MessagesStream<Key, Value, HeaderKey, HeaderValue> extends Readable
 
       for (const [leader, leaderRequests] of requests) {
         this.#inflightNodes.add(leader)
-        this.#consumer.fetch({ ...this.#options, node: leader, topics: leaderRequests, connectionPool: this[kConnections] }, (error, response) => {
-          this.#inflightNodes.delete(leader)
-          this.emit('fetch')
+        this.#consumer.fetch(
+          { ...this.#options, node: leader, topics: leaderRequests, connectionPool: this[kConnections] },
+          (error, response) => {
+            this.#inflightNodes.delete(leader)
+            this.emit('fetch')
 
-          if (error) {
-            // The stream has been closed, ignore the error
-            /* c8 ignore next 4 - Hard to test */
-            if (this.#closed || this.closed || this.destroyed) {
-              this.push(null)
+            if (error) {
+              // The stream has been closed, ignore the error
+              /* c8 ignore next 4 - Hard to test */
+              if (this.#closed || this.closed || this.destroyed) {
+                this.push(null)
+                return
+              }
+
+              this.destroy(error)
               return
             }
 
-            this.destroy(error)
-            return
-          }
+            if (this.#closed || this.closed || this.destroyed) {
+              // When it's the last inflight, we finally close the stream.
+              // This is done to avoid the user exiting from consmuming metrics like for-await and still see the process up.
+              if (this.#inflightNodes.size === 0) {
+                this.push(null)
+              }
 
-          if (this.#closed || this.closed || this.destroyed) {
-            // When it's the last inflight, we finally close the stream.
-            // This is done to avoid the user exiting from consmuming metrics like for-await and still see the process up.
-            if (this.#inflightNodes.size === 0) {
-              this.push(null)
+              return
             }
 
-            return
+            this.#pushRecordsOperation(metadata!, topicIds, response!, requestedOffsets)
           }
-
-          this.#pushRecordsOperation(metadata!, topicIds, response!, requestedOffsets)
-        })
+        )
       }
     })
   }
@@ -959,6 +1046,71 @@ export class MessagesStream<Key, Value, HeaderKey, HeaderValue> extends Readable
 
   #assignmentsForTopic (topic: string): GroupAssignment | undefined {
     return this.#consumer.assignments?.find(assignment => assignment.topic === topic)
+  }
+
+  #assignmentsAsKeys (): Set<string> | undefined {
+    const assignments = this.#consumer.assignments
+    if (!assignments) {
+      return
+    }
+
+    const assignmentsAsKeys = new Set<string>()
+    for (const assignment of assignments) {
+      for (const partition of assignment.partitions) {
+        assignmentsAsKeys.add(`${assignment.topic}:${partition}`)
+      }
+    }
+
+    return assignmentsAsKeys
+  }
+
+  #updatePausedTopicPartitions () {
+    // Remove unassigned topic-partitions from paused topic-partitions list
+    // when assignments change.
+    const initialSize = this.#pausedTopicPartitions.size
+    if (initialSize === 0) {
+      return
+    }
+
+    const assignments = this.#consumer.assignments
+    if (assignments) {
+      for (const { topic, partition } of this.#pausedTopicPartitions.values()) {
+        const assignment = assignments.find(
+          assignment => assignment.topic === topic && assignment.partitions.includes(partition)
+        )
+        if (!assignment) {
+          this.#pausedTopicPartitions.delete(`${topic}:${partition}`)
+        }
+      }
+    } else {
+      this.#pausedTopicPartitions.clear()
+    }
+
+    if (initialSize !== this.#pausedTopicPartitions.size) {
+      this.#afterPausedTopicPartitionsChange()
+    }
+  }
+
+  #afterPausedTopicPartitionsChange () {
+    const assignmentsAsKeys = this.#assignmentsAsKeys()
+    if (!assignmentsAsKeys) {
+      return
+    }
+
+    // Check if all assigned topic-partitions are paused and pause/resume stream accordingly
+    let isEveryTopicPartitionPaused = true
+    for (const key of assignmentsAsKeys) {
+      if (!this.#pausedTopicPartitions.has(key)) {
+        isEveryTopicPartitionPaused = false
+        break
+      }
+    }
+
+    if (isEveryTopicPartitionPaused && !this.#paused) {
+      this.pause()
+    } else if (!isEveryTopicPartitionPaused && this.#paused) {
+      this.resume()
+    }
   }
 
   #afterClose (error: Error | null) {
