@@ -29,6 +29,11 @@ export interface ExtendedGroupProtocolSubscription extends Omit<GroupProtocolSub
   memberId: string
 }
 
+export interface TopicPartitionPair {
+  topic: string
+  partition: number
+}
+
 export type Offsets = Map<string, bigint[]>
 export type OffsetsWithTimestamps = Map<string, Map<number, { offset: bigint; timestamp: bigint }>>
 

@@ -38,7 +38,8 @@ import {
   type ConsumeOptions,
   type CorruptedMessageHandler,
   type GroupAssignment,
-  type Offsets
+  type Offsets,
+  type TopicPartitionPair
 } from './types.ts'
 import { partitionKey } from './utils.ts'
 
@@ -84,6 +85,7 @@ export class MessagesStream<Key, Value, HeaderKey, HeaderValue> extends Readable
   #offsetsToCommit: Map<string, CommitOptionsPartition>
   #offsetsCommitted: Map<string, bigint>
   #partitionsEpochs: Map<string, number>
+  #pausedTopicPartitions: Map<string, TopicPartitionPair>
   #inflightNodes: Map<number, number>
   #keyDeserializer: DeserializerWithHeaders<Key, HeaderKey, HeaderValue>
   #valueDeserializer: DeserializerWithHeaders<Value, HeaderKey, HeaderValue>
@@ -167,6 +169,7 @@ export class MessagesStream<Key, Value, HeaderKey, HeaderValue> extends Readable
     this.#offsetsToCommit = new Map()
     this.#offsetsCommitted = new Map()
     this.#partitionsEpochs = new Map()
+    this.#pausedTopicPartitions = new Map()
     this.#paused = false
     this.#refreshOffsetsInflight = false
     this.#refreshOffsetsPending = false
@@ -191,6 +194,7 @@ export class MessagesStream<Key, Value, HeaderKey, HeaderValue> extends Readable
     this.#onConsumerGroupJoin = () => {
       this.#offsetsCommitted.clear()
       this.#partitionsEpochs.clear()
+      this.#updatePausedTopicPartitions()
       this.#scheduleRefreshOffsetsAndFetch()
     }
 
@@ -382,6 +386,68 @@ export class MessagesStream<Key, Value, HeaderKey, HeaderValue> extends Readable
     return super.pause()
   }
 
+  pauseTopicPartitions (topicPartitions: TopicPartitionPair[] | GroupAssignment[]): void {
+    // Track which topic-partitions were actually paused for emitting an event
+    const paused: TopicPartitionPair[] = []
+    const normalized = topicPartitions.flatMap<TopicPartitionPair>(pair =>
+      'partition' in pair ? pair : pair.partitions.map(partition => ({ topic: pair.topic, partition })))
+
+    const assignmentsAsKeys = this.#assignmentsAsKeys()
+    if (!assignmentsAsKeys) {
+      throw new UserError('No current assignments for consumer')
+    }
+
+    for (const pair of normalized) {
+      const key = `${pair.topic}:${pair.partition}`
+      if (!assignmentsAsKeys.has(key)) {
+        throw new UserError(`No current assignment for partition ${key}`)
+      }
+
+      if (!this.#pausedTopicPartitions.has(key)) {
+        this.#pausedTopicPartitions.set(key, pair)
+        paused.push(pair)
+      }
+    }
+
+    if (paused.length > 0) {
+      this.emit('pausedTopicPartitions', paused)
+      this.#afterPausedTopicPartitionsChange()
+    }
+  }
+
+  resumeTopicPartitions (topicPartitions: TopicPartitionPair[] | GroupAssignment[]): void {
+    // Track which topic-partitions were actually resumed for emitting an event
+    const resumed: TopicPartitionPair[] = []
+    const normalized = topicPartitions.flatMap<TopicPartitionPair>(pair =>
+      'partition' in pair ? pair : pair.partitions.map(partition => ({ topic: pair.topic, partition })))
+
+    const assignmentsAsKeys = this.#assignmentsAsKeys()
+    if (!assignmentsAsKeys) {
+      throw new UserError('No current assignments for consumer')
+    }
+
+    for (const pair of normalized) {
+      const key = `${pair.topic}:${pair.partition}`
+      if (!assignmentsAsKeys.has(key)) {
+        throw new UserError(`No current assignment for partition ${key}`)
+      }
+
+      if (this.#pausedTopicPartitions.has(key)) {
+        this.#pausedTopicPartitions.delete(key)
+        resumed.push(pair)
+      }
+    }
+
+    if (resumed.length > 0) {
+      this.emit('resumedTopicPartitions', resumed)
+      this.#afterPausedTopicPartitionsChange()
+    }
+  }
+
+  getPausedTopicPartitions (): TopicPartitionPair[] {
+    return Array.from(this.#pausedTopicPartitions.values())
+  }
+
   /*
     TypeScript support - Extracted from node @types/node/stream.d.ts
 
@@ -410,6 +476,8 @@ export class MessagesStream<Key, Value, HeaderKey, HeaderValue> extends Readable
   addListener (event: 'pause', listener: () => void): this
   addListener (event: 'readable', listener: () => void): this
   addListener (event: 'resume', listener: () => void): this
+  addListener (event: 'pausedTopicPartitions', listener: (topicPartitions: TopicPartitionPair[]) => void): this
+  addListener (event: 'resumedTopicPartitions', listener: (topicPartitions: TopicPartitionPair[]) => void): this
   /* c8 ignore next 3 - Only forwards to Node.js implementation - Inserted here to please Typescript */
   addListener (event: string | symbol, listener: (...args: any[]) => void): this {
     return super.addListener(event, listener)
@@ -425,6 +493,8 @@ export class MessagesStream<Key, Value, HeaderKey, HeaderValue> extends Readable
   on (event: 'pause', listener: () => void): this
   on (event: 'readable', listener: () => void): this
   on (event: 'resume', listener: () => void): this
+  on (event: 'pausedTopicPartitions', listener: (topicPartitions: TopicPartitionPair[]) => void): this
+  on (event: 'resumedTopicPartitions', listener: (topicPartitions: TopicPartitionPair[]) => void): this
   /* c8 ignore next 3 - Only forwards to Node.js implementation - Inserted here to please Typescript */
   on (event: string | symbol, listener: (...args: any[]) => void): this {
     return super.on(event, listener)
@@ -440,6 +510,8 @@ export class MessagesStream<Key, Value, HeaderKey, HeaderValue> extends Readable
   once (event: 'pause', listener: () => void): this
   once (event: 'readable', listener: () => void): this
   once (event: 'resume', listener: () => void): this
+  once (event: 'pausedTopicPartitions', listener: (topicPartitions: TopicPartitionPair[]) => void): this
+  once (event: 'resumedTopicPartitions', listener: (topicPartitions: TopicPartitionPair[]) => void): this
   /* c8 ignore next 3 - Only forwards to Node.js implementation - Inserted here to please Typescript */
   once (event: string | symbol, listener: (...args: any[]) => void): this {
     return super.once(event, listener)
@@ -455,6 +527,8 @@ export class MessagesStream<Key, Value, HeaderKey, HeaderValue> extends Readable
   prependListener (event: 'pause', listener: () => void): this
   prependListener (event: 'readable', listener: () => void): this
   prependListener (event: 'resume', listener: () => void): this
+  prependListener (event: 'pausedTopicPartitions', listener: (topicPartitions: TopicPartitionPair[]) => void): this
+  prependListener (event: 'resumedTopicPartitions', listener: (topicPartitions: TopicPartitionPair[]) => void): this
   /* c8 ignore next 3 - Only forwards to Node.js implementation - Inserted here to please Typescript */
   prependListener (event: string | symbol, listener: (...args: any[]) => void): this {
     return super.prependListener(event, listener)
@@ -470,6 +544,8 @@ export class MessagesStream<Key, Value, HeaderKey, HeaderValue> extends Readable
   prependOnceListener (event: 'pause', listener: () => void): this
   prependOnceListener (event: 'readable', listener: () => void): this
   prependOnceListener (event: 'resume', listener: () => void): this
+  prependOnceListener (event: 'pausedTopicPartitions', listener: (topicPartitions: TopicPartitionPair[]) => void): this
+  prependOnceListener (event: 'resumedTopicPartitions', listener: (topicPartitions: TopicPartitionPair[]) => void): this
   /* c8 ignore next 3 - Only forwards to Node.js implementation - Inserted here to please Typescript */
   prependOnceListener (event: string | symbol, listener: (...args: any[]) => void): this {
     return super.prependOnceListener(event, listener)
@@ -560,7 +636,15 @@ export class MessagesStream<Key, Value, HeaderKey, HeaderValue> extends Readable
           continue
         }
 
-        const partitions = assignment.partitions
+        let partitions = assignment.partitions
+        if (this.#pausedTopicPartitions.size > 0) {
+          partitions = partitions.filter(partition => !this.#pausedTopicPartitions.has(`${topic}:${partition}`))
+        }
+
+        // All partitions for this topic were paused, continue
+        if (partitions.length === 0) {
+          continue
+        }
 
         for (const partition of partitions) {
           const targetNode = this.#consumer[kGetFetchNode](metadata!, topic, partition, now)
@@ -604,69 +688,65 @@ export class MessagesStream<Key, Value, HeaderKey, HeaderValue> extends Readable
 
       for (const [node, nodeRequests] of requests) {
         this.#inflightNodes.set(node, Date.now())
-        this.#consumer.fetch(
-          { ...this.#options, node, topics: nodeRequests, connectionPool: this[kConnections] },
-          (error, response) => {
-            this.#inflightNodes.delete(node)
-            this.emit('fetch')
+        this.#consumer.fetch({ ...this.#options, node, topics: nodeRequests, connectionPool: this[kConnections] }, (
+          error,
+          response
+        ) => {
+          this.#inflightNodes.delete(node)
+          this.emit('fetch')
 
-            if (error) {
-              // The stream has been closed, ignore the error
-              /* c8 ignore next 4 - Hard to test */
-              if (this.#closed || this.closed || this.destroyed) {
-                this.push(null)
-                return
-              }
-
-              if (this.#fallbackMode !== MessagesStreamFallbackModes.FAIL) {
-                this.#handleOffsetOutOfRange(error as GenericError, topicIds, (recoveryError, recovered) => {
-                  if (this.#closed || this.closed || this.destroyed) {
-                    return
-                  }
-
-                  if (recoveryError) {
-                    this.destroy(recoveryError)
-                    return
-                  }
-
-                  if (recovered) {
-                    process.nextTick(() => {
-                      this.#fetch()
-                    })
-                    return
-                  }
-
-                  this.destroy(error)
-                })
-                return
-              }
-
-              this.destroy(error)
-              return
-            }
-
+          if (error) {
+            // The stream has been closed, ignore the error
+            /* c8 ignore next 4 - Hard to test */
             if (this.#closed || this.closed || this.destroyed) {
-              // When it's the last inflight, we finally close the stream.
-              // This is done to avoid the user exiting from consmuming metrics like for-await and still see the process up.
-              if (this.#inflightNodes.size === 0) {
-                this.push(null)
-              }
-
+              this.push(null)
               return
             }
 
-            this.#pushRecordsOperation(metadata!, topicIds, response!, requestedOffsets)
+            if (this.#fallbackMode !== MessagesStreamFallbackModes.FAIL) {
+              this.#handleOffsetOutOfRange(error as GenericError, topicIds, (recoveryError, recovered) => {
+                if (this.#closed || this.closed || this.destroyed) {
+                  return
+                }
+
+                if (recoveryError) {
+                  this.destroy(recoveryError)
+                  return
+                }
+
+                if (recovered) {
+                  process.nextTick(() => {
+                    this.#fetch()
+                  })
+                  return
+                }
+
+                this.destroy(error)
+              })
+              return
+            }
+
+            this.destroy(error)
+            return
           }
-        )
+
+          if (this.#closed || this.closed || this.destroyed) {
+            // When it's the last inflight, we finally close the stream.
+            // This is done to avoid the user exiting from consmuming metrics like for-await and still see the process up.
+            if (this.#inflightNodes.size === 0) {
+              this.push(null)
+            }
+
+            return
+          }
+
+          this.#pushRecordsOperation(metadata!, topicIds, response!, requestedOffsets)
+        })
       }
     })
   }
 
-  #handleOffsetOutOfRange (
-    error: GenericError,
-    topicIds: Map<string, string>,
-    callback: Callback<boolean>
-  ): void {
+  #handleOffsetOutOfRange (error: GenericError, topicIds: Map<string, string>, callback: Callback<boolean>): void {
     if (!error.findBy?.('apiId', 'OFFSET_OUT_OF_RANGE')) {
       callback(null, false)
       return
@@ -1192,6 +1272,71 @@ export class MessagesStream<Key, Value, HeaderKey, HeaderValue> extends Readable
 
   #assignmentsForTopic (topic: string): GroupAssignment | undefined {
     return this.#consumer.assignments?.find(assignment => assignment.topic === topic)
+  }
+
+  #assignmentsAsKeys (): Set<string> | undefined {
+    const assignments = this.#consumer.assignments
+    if (!assignments) {
+      return
+    }
+
+    const assignmentsAsKeys = new Set<string>()
+    for (const assignment of assignments) {
+      for (const partition of assignment.partitions) {
+        assignmentsAsKeys.add(`${assignment.topic}:${partition}`)
+      }
+    }
+
+    return assignmentsAsKeys
+  }
+
+  #updatePausedTopicPartitions () {
+    // Remove unassigned topic-partitions from paused topic-partitions list
+    // when assignments change.
+    const initialSize = this.#pausedTopicPartitions.size
+    if (initialSize === 0) {
+      return
+    }
+
+    const assignments = this.#consumer.assignments
+    if (assignments) {
+      for (const { topic, partition } of this.#pausedTopicPartitions.values()) {
+        const assignment = assignments.find(
+          assignment => assignment.topic === topic && assignment.partitions.includes(partition)
+        )
+        if (!assignment) {
+          this.#pausedTopicPartitions.delete(`${topic}:${partition}`)
+        }
+      }
+    } else {
+      this.#pausedTopicPartitions.clear()
+    }
+
+    if (initialSize !== this.#pausedTopicPartitions.size) {
+      this.#afterPausedTopicPartitionsChange()
+    }
+  }
+
+  #afterPausedTopicPartitionsChange () {
+    const assignmentsAsKeys = this.#assignmentsAsKeys()
+    if (!assignmentsAsKeys) {
+      return
+    }
+
+    // Check if all assigned topic-partitions are paused and pause/resume stream accordingly
+    let isEveryTopicPartitionPaused = true
+    for (const key of assignmentsAsKeys) {
+      if (!this.#pausedTopicPartitions.has(key)) {
+        isEveryTopicPartitionPaused = false
+        break
+      }
+    }
+
+    if (isEveryTopicPartitionPaused && !this.#paused) {
+      this.pause()
+    } else if (!isEveryTopicPartitionPaused && this.#paused) {
+      this.resume()
+    }
   }
 
   #afterClose (error: Error | null) {
